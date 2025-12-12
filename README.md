@@ -33,4 +33,6 @@ This will:
 Running the script produces output similar to:
 Performance: {'sharpe': 2.41, 'total_pnl': 56.72}
 
-A plot of cumulative PnL is also shown.
+A plot of cumulative PnL and z-score spread is shown below.
+<img width="1280" height="612" alt="Figure_1" src="https://github.com/user-attachments/assets/f0e6bc10-06d7-40b9-a226-32fefd52bcb4" />
+
