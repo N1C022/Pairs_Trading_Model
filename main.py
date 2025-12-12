@@ -1,127 +1,200 @@
 """
 pairs_trading.py
 
-Implements a cointegration-based pairs trading backtest:
-- tests cointegration with statsmodels.tsa.stattools.coint
-- fits OLS to get beta and spread
-- computes z-score of spread
-- entry/exit rules: enter when z > entry_z or z < -entry_z, exit when |z| < exit_z
-- beta-neutral position sizing (dollar-neutral)
-- returns performance metrics and simple plot when run as script
+Implements a cointegration-based pairs trading backtest using a class-based structure.
+Features:
+- Rolling OLS for dynamic beta and spread calculation
+- Z-score based entry/exit signals
+- Dollar-neutral position sizing
 """
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-import statsmodels.tsa.stattools as ts
+from statsmodels.regression.rolling import RollingOLS
 import matplotlib.pyplot as plt
 
-def fit_pair(series_x: pd.Series, series_y: pd.Series):
-    """
-    Regress y on x (y = a + b*x + eps) and return b (beta), intercept, residuals, pvalue of coint.
-    """
-    x = sm.add_constant(series_x)
-    model = sm.OLS(series_y, x).fit()
-    intercept = model.params[0]
-    beta = model.params[1]
-    resid = model.resid
-    coint_t, pvalue, _ = ts.coint(series_y, series_x)
-    return {"beta": beta, "intercept": intercept, "resid": resid, "coint_pvalue": pvalue}
+class PairsTrader:
+    def __init__(self, entry_z: float = 2.0, exit_z: float = 0.5, lookback: int = 252, fee: float = 0.0):
+        self.entry_z = entry_z
+        self.exit_z = exit_z
+        self.lookback = lookback
+        self.fee = fee
+        self.results = None
 
-def backtest_pairs(series_x: pd.Series, series_y: pd.Series,
-                   entry_z: float = 2.0, exit_z: float = 0.5,
-                   lookback: int = 252, fee: float = 0.0):
-    """
-    Rolling backtest:
-    - Use expanding or rolling estimation for beta; here we use rolling OLS over 'lookback'
-      (if insufficient history, we skip trading)
-    - Returns DataFrame with positions and pnl
-    """
-    n = len(series_x)
-    df = pd.DataFrame({"x": series_x, "y": series_y}).dropna()
-    df["beta"] = np.nan
-    df["intercept"] = np.nan
-    df["spread"] = np.nan
-    df["zscore"] = np.nan
-    df["pos_x"] = 0.0  # position in shares of x (positive = long)
-    df["pos_y"] = 0.0  # position in shares of y
-    df["pnl"] = 0.0
+    def backtest(self, series_x: pd.Series, series_y: pd.Series) -> pd.DataFrame:
+        """
+        Run the pairs trading backtest.
+        :param series_x: Price series for asset X (independent variable)
+        :param series_y: Price series for asset Y (dependent variable)
+        :return: DataFrame with full backtest results
+        """
+        # Align data
+        df = pd.DataFrame({"x": series_x, "y": series_y}).dropna()
+        
+        # 1. Rolling OLS for Beta and Intercept
+        # y = alpha + beta * x
+        exog = sm.add_constant(df["x"])
+        # RollingOLS requires pandas >= 0.24 and statsmodels >= 0.11
+        rols = RollingOLS(df["y"], exog, window=self.lookback)
+        rres = rols.fit()
+        params = rres.params
+        
+        df["intercept"] = params["const"]
+        df["beta"] = params["x"]
+        
+        # 2. Calculate Spread and Z-Score
+        # Spread = y - (alpha + beta * x)
+        df["spread"] = df["y"] - (df["intercept"] + df["beta"] * df["x"])
+        
+        # Rolling stats for spread Z-score
+        # We use a rolling window of the spread itself to normalize it. 
+        # Alternatively, we could use the residuals' std from OLS, but normalizing the spread 
+        # based on recent history is also common. Let's stick to the previous logic:
+        # The previous logic calculated mean/std of the *residuals* over the lookback window.
+        # RollingOLS residuals are accessible, but let's recalculate rolling z-score of the spread
+        # to match the logic of "observing the spread distribution".
+        rolling_mean = df["spread"].rolling(window=self.lookback).mean()
+        rolling_std = df["spread"].rolling(window=self.lookback).std()
+        
+        df["zscore"] = (df["spread"] - rolling_mean) / rolling_std
+        
+        # 3. Generate Signals and Positions
+        df["pos_x"] = 0.0
+        df["pos_y"] = 0.0
+        
+        # We need to iterate for state-dependent logic (exit requires checks against current position)
+        # To make this faster, we convert necessary columns to numpy arrays
+        z_values = df["zscore"].values
+        px_values = df["x"].values
+        py_values = df["y"].values
+        
+        pos_x = np.zeros(len(df))
+        pos_y = np.zeros(len(df))
+        
+        current_pos = 0 # 0: flat, 1: long spread (long y, short x), -1: short spread (short y, long x)
+        # Note: Long spread usually means betting spread increases. 
+        # If Spread = Y - Beta*X. 
+        # If Z < -entry: Spread is too low, expect rise -> Buy Spread -> Buy Y, Sell X.
+        # If Z > entry: Spread is too high, expect drop -> Sell Spread -> Sell Y, Buy X.
+        
+        # We start loop from 'lookback' because z-score is NaN before that
+        for t in range(self.lookback, len(df)):
+            z = z_values[t]
+            px = px_values[t]
+            py = py_values[t]
+            
+            # Carry forward previous position (will be overwritten if signal changes)
+            prev_x_shares = pos_x[t-1]
+            prev_y_shares = pos_y[t-1]
+            
+            # Check exit first if we are in a position
+            if current_pos != 0:
+                if abs(z) < self.exit_z:
+                    current_pos = 0
+                    pos_x[t] = 0.0
+                    pos_y[t] = 0.0
+                else:
+                    # Hold position
+                    pos_x[t] = prev_x_shares
+                    pos_y[t] = prev_y_shares
+            
+            # Check entry if we are flat
+            else: # current_pos == 0
+                if z > self.entry_z:
+                    # Spread too high -> Short Spread -> Short Y, Long X
+                    # Dollar neutral weighting
+                    # w_x * px = w_y * py = 0.5 (assuming $1 total exposure) -> w_x = 0.5, w_y = 0.5
+                    # OR w_x = py / (px + py) for fully balanced
+                    w_x = py / (px + py)
+                    w_y = 1 - w_x
+                    
+                    pos_x[t] = w_x / px   # Long X
+                    pos_y[t] = -w_y / py  # Short Y
+                    current_pos = -1
+                    
+                elif z < -self.entry_z:
+                    # Spread too low -> Long Spread -> Long Y, Short X
+                    w_x = py / (px + py)
+                    w_y = 1 - w_x
+                    
+                    pos_x[t] = -w_x / px  # Short X
+                    pos_y[t] = w_y / py   # Long Y
+                    current_pos = 1
+                else:
+                    # Remain flat
+                    pos_x[t] = 0.0
+                    pos_y[t] = 0.0
 
-    for t in range(lookback, len(df)):
-        window = df.iloc[t-lookback:t]
-        res = fit_pair(window["x"], window["y"])
-        beta = res["beta"]
-        intercept = res["intercept"]
-        spread = df["y"].iloc[t] - (intercept + beta * df["x"].iloc[t])
-        # compute rolling mean/std of residuals using window
-        resid_window = window["y"] - (res["intercept"] + res["beta"] * window["x"])
-        m = resid_window.mean()
-        s = resid_window.std(ddof=0) if resid_window.std(ddof=0) > 0 else 1e-9
-        z = (spread - m) / s
+        df["pos_x"] = pos_x
+        df["pos_y"] = pos_y
+        
+        # 4. Calculate PnL
+        # PnL = pos_x * change_in_x + pos_y * change_in_y
+        # Shift positions by 1 to represent "position held at start of day" applied to "price change today"
+        # The previous code used pos[t-1] * (price[t] - price[t-1]), which is correct.
+        
+        df["pnl"] = (df["pos_x"].shift(1) * df["x"].diff()) + (df["pos_y"].shift(1) * df["y"].diff())
+        
+        # Transaction Costs
+        # trade_size * price * fee
+        # pos change for x
+        pos_change_x = df["pos_x"].diff().abs().fillna(0)
+        pos_change_y = df["pos_y"].diff().abs().fillna(0)
+        
+        costs = self.fee * (pos_change_x * df["x"] + pos_change_y * df["y"])
+        df["pnl"] -= costs
+        
+        df["cum_pnl"] = df["pnl"].cumsum()
+        self.results = df
+        return df
 
-        df.at[df.index[t], "beta"] = beta
-        df.at[df.index[t], "intercept"] = intercept
-        df.at[df.index[t], "spread"] = spread
-        df.at[df.index[t], "zscore"] = z
-
-        # simple strategy: if z > entry -> short y, long x to be beta-neutral (dollar neutral)
-        # dollar-neutral sizing: size positions so dollar exposure equal
-        # assume we invest $1 total when we enter (or scale by volatility if you prefer)
-        pos_x = df["pos_x"].iloc[t-1]
-        pos_y = df["pos_y"].iloc[t-1]
-        px = df["x"].iloc[t]
-        py = df["y"].iloc[t]
-
-        # exit condition
-        if abs(z) < exit_z:
-            pos_x, pos_y = 0.0, 0.0
+    def summarize_performance(self):
+        if self.results is None:
+            return "No results. Run backtest() first."
+        
+        returns = self.results["pnl"].dropna()
+        total_pnl = self.results["cum_pnl"].iloc[-1]
+        if returns.std() > 0:
+            sharpe = (returns.mean() / returns.std()) * np.sqrt(252)
         else:
-            if z > entry_z:
-                # expect y to drop relative to x: short y, long x
-                # set dollar neutral: w_x * px = w_y * py
-                # choose weights w_x and w_y such that w_x + w_y = 1 (dollar invested)
-                # solve: w_x * px = w_y * py -> w_x * px = (1 - w_x) * py -> w_x = py / (px + py)
-                w_x = py / (px + py)
-                w_y = 1 - w_x
-                # but to keep signs: x long, y short
-                pos_x = w_x / px  # shares of x (long)
-                pos_y = -w_y / py  # shares of y (short)
-            elif z < -entry_z:
-                # expect y to rise relative to x: long y, short x
-                w_x = py / (px + py)
-                w_y = 1 - w_x
-                pos_x = -w_x / px
-                pos_y = w_y / py
-
-        df.at[df.index[t], "pos_x"] = pos_x
-        df.at[df.index[t], "pos_y"] = pos_y
-
-        # PnL from previous day's held positions (mark-to-market)
-        prev_px = df["x"].iloc[t-1]
-        prev_py = df["y"].iloc[t-1]
-        prev_pos_x = df["pos_x"].iloc[t-1]
-        prev_pos_y = df["pos_y"].iloc[t-1]
-
-        pnl = prev_pos_x * (px - prev_px) + prev_pos_y * (py - prev_py)
-        # subtract fees: round-trip on change in positions (very simplified)
-        trade_cost = fee * (abs(df["pos_x"].iloc[t] - prev_pos_x) * px + abs(df["pos_y"].iloc[t] - prev_pos_y) * py)
-        df.at[df.index[t], "pnl"] = pnl - trade_cost
-
-    df["cum_pnl"] = df["pnl"].cumsum()
-    # simple performance
-    returns = df["pnl"].dropna()
-    if returns.std() > 0:
-        sharpe = (returns.mean() / returns.std()) * np.sqrt(252)
-    else:
-        sharpe = 0.0
-    return df, {"sharpe": sharpe, "total_pnl": df["cum_pnl"].iloc[-1]}
+            sharpe = 0.0
+            
+        return {
+            "Total PnL": total_pnl,
+            "Sharpe Ratio": sharpe
+        }
+    
+    def plot_performance(self):
+        if self.results is None:
+            print("No results to plot.")
+            return
+        
+        plt.figure(figsize=(12, 8))
+        
+        ax1 = plt.subplot(2, 1, 1)
+        self.results["cum_pnl"].plot(ax=ax1, title="Pairs Trading Cumulative PnL", color='green')
+        ax1.set_ylabel("PnL ($)")
+        ax1.grid(True)
+        
+        ax2 = plt.subplot(2, 1, 2)
+        self.results["zscore"].plot(ax=ax2, title="Spread Z-Score", color='blue', alpha=0.6)
+        ax2.axhline(self.entry_z, color='red', linestyle='--', label='Entry')
+        ax2.axhline(-self.entry_z, color='red', linestyle='--')
+        ax2.axhline(self.exit_z, color='black', linestyle=':', label='Exit')
+        ax2.axhline(-self.exit_z, color='black', linestyle=':')
+        ax2.legend()
+        ax2.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
 
 if __name__ == "__main__":
-    # Example using synthetic cointegrated series
+    # Example usage
     np.random.seed(42)
     T = 1000
     x = np.cumsum(np.random.normal(0, 1, T)) + 50
-    # y is x * beta + stationary noise
+    # Cointegrated y
     true_beta = 1.3
     y = true_beta * x + np.random.normal(0, 1.5, T)
 
@@ -129,7 +202,8 @@ if __name__ == "__main__":
     sx = pd.Series(x, index=dates)
     sy = pd.Series(y, index=dates)
 
-    df, perf = backtest_pairs(sx, sy, entry_z=2.0, exit_z=0.5, lookback=200, fee=0.0)
-    print("Performance:", perf)
-    df["cum_pnl"].plot(title="Pairs Trading Cumulative PnL")
-    plt.show()
+    trader = PairsTrader(entry_z=2.0, exit_z=0.5, lookback=20, fee=0.0) # Reduced lookback for example
+    df = trader.backtest(sx, sy)
+    
+    print("Performance:", trader.summarize_performance())
+    trader.plot_performance()
