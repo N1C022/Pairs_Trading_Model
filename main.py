@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from statsmodels.regression.rolling import RollingOLS
+from statsmodels.tsa.stattools import adfuller
+import scipy.stats as stats
 import matplotlib.pyplot as plt
 
 class PairsTrader:
@@ -232,22 +234,211 @@ class PairsTrader:
         return df
 
     def summarize_performance(self):
+        return self.calculate_metrics()
+
+    def calculate_metrics(self):
+        """
+        Calculate a comprehensive set of performance metrics.
+        """
         if self.results is None:
-            return "No results. Run backtest() first."
+            return {}
+            
+        df = self.results
+        returns = df["pnl"] # Daily PnL in dollars. 
+        # Note: To get % returns properly, we need a capital base. 
+        # Assuming we allocate 1.0 (or capital C) to the strategy.
+        # Since the user asked for cumulative PnL (%) and returns, we'll assume a notional capital of 1.0 for simplicity
+        # or treat PnL as dollar PnL and Returns as PnL / 1.0. 
+        # Let's assume Initial Capital = 100 or simply report PnL as absolute if capital is unknown, 
+        # but to satisfy "%" requests, we need a base.
+        # Implied assumption: The positions (weights) sum to ~1.0 gross (0.5 long, 0.5 short).
         
-        returns = self.results["pnl"].dropna()
-        total_pnl = self.results["cum_pnl"].iloc[-1]
+        # 1. Risk/Return Metrics
+        total_pnl = df["pnl"].sum()
+        avg_daily_pnl = returns.mean()
+        std_daily_pnl = returns.std()
         
-        if returns.std() > 0:
-            sharpe = (returns.mean() / returns.std()) * np.sqrt(252)
+        annual_factor = 252
+        
+        if std_daily_pnl > 0:
+            sharpe = (avg_daily_pnl / std_daily_pnl) * np.sqrt(annual_factor)
+            # Sortino
+            downside_returns = returns[returns < 0]
+            if len(downside_returns) > 0:
+                downside_std = downside_returns.std()
+                sortino = (avg_daily_pnl / downside_std) * np.sqrt(annual_factor)
+            else:
+                sortino = np.inf
         else:
             sharpe = 0.0
+            sortino = 0.0
             
+        # Max Drawdown
+        cum_pnl_series = df["cum_pnl"]
+        running_max = cum_pnl_series.cummax()
+        drawdown = cum_pnl_series - running_max
+        # Since these are absolute dollar amounts, let's treat generic drawdown.
+        # If we interpret as %, we need capital. Let's assume capital is large enough that PnL is additive.
+        # Or, just report Max Drawdown in $ terms.
+        # However, user asked for "%". Let's assume the trade sizes (weights ~1.0) imply a base of 1.0.
+        # So PnL of 0.10 means 10%.
+        max_drawdown = drawdown.min()
+        max_drawdown_pct = max_drawdown * 100.0 # Assuming 1.0 base
+        
+        cum_pnl_pct = total_pnl * 100.0
+        
+        # Annualised Return (Simple compounding approximation)
+        n_days = len(df)
+        if n_days > 0:
+            ann_return = (total_pnl / n_days) * 252 * 100 # Arithmetic annualization
+        else:
+            ann_return = 0.0
+
+        # Skew / Kurtosis
+        clean_returns = returns.dropna()
+        ret_skew = stats.skew(clean_returns)
+        ret_kurt = stats.kurtosis(clean_returns)
+
+        # 2. Trade Statistics
+        trade_stats = self._calculate_trade_stats(df)
+        
+        # 3. Spread & Model Stats
+        spread = df["spread"].dropna()
+        spread_mean = spread.mean()
+        spread_std = spread.std()
+        
+        # ADF Test
+        try:
+            adf_res = adfuller(spread)
+            adf_pvalue = adf_res[1]
+        except:
+            adf_pvalue = np.nan
+            
+        # Half-life
+        halflife = self._calculate_halflife(spread)
+        
+        # Time in market
+        days_in_market = (df["pos_x"] != 0).sum()
+        pct_time_in_market = (days_in_market / n_days) * 100
+        
         return {
-            "Total PnL": total_pnl,
-            "Sharpe Ratio": sharpe,
-            "Final Z-Score": self.results["zscore"].iloc[-1]
+            "Annualised Sharpe Ratio": round(sharpe, 2),
+            "Sortino Ratio": round(sortino, 2),
+            "Cumulative PnL (%)": round(cum_pnl_pct, 2),
+            "Annualised Return (%)": round(ann_return, 2),
+            "Max Drawdown (%)": round(max_drawdown_pct, 2),
+            "Number of Trades": trade_stats["count"],
+            "Win Rate (%)": round(trade_stats["win_rate"] * 100, 2),
+            "Average Holding Period": round(trade_stats["avg_holding"], 2),
+            "Mean Spread": round(spread_mean, 5),
+            "Std Spread": round(spread_std, 5),
+            "Half-life": round(halflife, 2) if halflife else None,
+            "ADF p-value": round(adf_pvalue, 4),
+            "Time in Market (%)": round(pct_time_in_market, 2),
+            "Skewness": round(ret_skew, 2),
+            "Kurtosis": round(ret_kurt, 2),
+            "Entry Z": self.entry_z,
+            "Exit Z": self.exit_z,
         }
+
+    def _calculate_trade_stats(self, df):
+        # Identify trades based on pos_x changing from 0 to something, or flipping.
+        # Since we have pos_x column, we can iterate.
+        # A trade is defined from opening a position (0 -> non-0) to closing it (non-0 -> 0).
+        # Note: Reversals (Long -> Short directly) should be treated as Close Old -> Open New.
+        
+        trades = []
+        in_trade = False
+        start_entry_idx = 0
+        entry_pnl = 0.0
+        
+        # Positions
+        pos = df["pos_x"].values
+        pnl = df["pnl"].values # Daily PnL
+        
+        current_trade_pnl = 0.0
+        current_trade_days = 0
+        
+        for t in range(1, len(df)):
+            if pos[t] != 0:
+                if not in_trade:
+                    # New trade opened
+                    in_trade = True
+                    start_entry_idx = t
+                    current_trade_pnl = pnl[t] # Includes transaction cost of entry
+                    current_trade_days = 1
+                else:
+                    # Continuing trade
+                    # Check if position flipped sign (Long <-> Short)
+                    if np.sign(pos[t]) != np.sign(pos[t-1]):
+                        # Reverse: Close current, Open new
+                        trades.append({"pnl": current_trade_pnl, "days": current_trade_days})
+                        
+                        # New trade starts
+                        # pnl[t] contains cost of flipping.
+                        # Ideally splitting pnl[t] is hard without more data.
+                        # Simplified: Assign this day's PnL to the *new* trade? 
+                        # Or split? Let's treat pnl[t] as belonging to the new position for simplicity 
+                        # as it pays the cost for the new direction.
+                        current_trade_pnl = pnl[t]
+                        current_trade_days = 1
+                    else:
+                        current_trade_pnl += pnl[t]
+                        current_trade_days += 1
+            else:
+                if in_trade:
+                    # Trade closed (pos becomes 0)
+                    # pnl[t] is the PnL of the closing day (usually just cost or 0 return from flat)
+                    # Use pnl[t] which captures exit cost
+                    current_trade_pnl += pnl[t]
+                    trades.append({"pnl": current_trade_pnl, "days": current_trade_days})
+                    in_trade = False
+                    current_trade_pnl = 0.0
+                    current_trade_days = 0
+        
+        # If still open at end, count as trade?
+        if in_trade:
+            trades.append({"pnl": current_trade_pnl, "days": current_trade_days})
+            
+        if not trades:
+            return {"count": 0, "win_rate": 0.0, "avg_holding": 0.0}
+            
+        pnls = [t["pnl"] for t in trades]
+        # Win rate
+        wins = sum(1 for p in pnls if p > 0)
+        win_rate = wins / len(trades)
+        
+        # Avg holding
+        days = [t["days"] for t in trades]
+        avg_holding = np.mean(days)
+        
+        return {"count": len(trades), "win_rate": win_rate, "avg_holding": avg_holding}
+
+    def _calculate_halflife(self, spread):
+        # Ornstein-Uhlenbeck: dy = -theta * y * dt + sigma * dW
+        # Discrete: y[t] - y[t-1] = -theta * y[t-1] + epsilon
+        # Regress (y[t] - y[t-1]) on y[t-1]
+        
+        spread_lag = spread.shift(1).dropna()
+        spread_diff = spread.diff().dropna()
+        
+        # Align
+        idx = spread_lag.index.intersection(spread_diff.index)
+        spread_lag = spread_lag.loc[idx]
+        spread_diff = spread_diff.loc[idx]
+        
+        if len(spread_lag) < 10:
+            return None
+        
+        model = sm.OLS(spread_diff, spread_lag)
+        res = model.fit()
+        
+        theta = -res.params.iloc[0]
+        if theta <= 0:
+            return np.inf # Non-mean-reverting
+            
+        halflife = np.log(2) / theta
+        return halflife
     
     def plot_performance(self):
         if self.results is None:
