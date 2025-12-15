@@ -1,14 +1,3 @@
-"""
-pairs_trading.py
-
-Implements a cointegration-based pairs trading backtest using a class-based structure.
-Features:
-- Rolling OLS or Kalman Filter for dynamic beta and spread calculation
-- Z-score based entry/exit signals
-- Dollar-neutral position sizing
-- Risk Management: Stop-loss and Max Holding Period
-"""
-
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
@@ -16,7 +5,6 @@ from statsmodels.regression.rolling import RollingOLS
 from statsmodels.tsa.stattools import adfuller
 import scipy.stats as stats
 import matplotlib.pyplot as plt
-
 class PairsTrader:
     def __init__(self, entry_z: float = 2.0, exit_z: float = 0.5, lookback: int = 252, fee: float = 0.0,
                  use_kalman: bool = True, stop_loss_z: float = 4.0, max_holding_period: int = 20, kalman_delta: float = 1e-5):
@@ -31,12 +19,10 @@ class PairsTrader:
         self.results = None
 
     def _run_kalman_filter(self, x, y):
-        """
-        Run Kalman Filter to estimate dynamic regression coefficients (slope and intercept).
-        y = alpha + beta * x + noise
+        # Kalman Filter estimates regression coefficients (slope and intercept).
+        # y = alpha + beta * x + noise
         
-        State: theta = [alpha, beta]
-        """
+        # theta = [alpha, beta]
         n = len(x)
         state_means = np.zeros((n, 2))
         
@@ -44,7 +30,7 @@ class PairsTrader:
         theta = np.zeros(2)
         P = np.eye(2) * 1.0 # Initial covariance
         
-        # Transition covariance (process noise)
+        # transition covariance (process noise)
         # Using a small noise for random walk
         Q = self.kalman_delta * np.eye(2)
         
@@ -52,12 +38,12 @@ class PairsTrader:
         R = 0.001 
         
         for t in range(n):
-            # 1. Prediction
+            # Prediction
             # theta(t|t-1) = theta(t-1)
             # P(t|t-1) = P(t-1) + Q
             P = P + Q
             
-            # 2. Update
+            # Update
             xt = x[t]
             yt = y[t]
             H = np.array([1.0, xt])
@@ -67,7 +53,7 @@ class PairsTrader:
             error = yt - y_pred
             
             # Innovation variance: S = H P H.T + R
-            # This can explode if x is large and P is large.
+            # can explode if x is large and P is large.
             S = np.dot(H, np.dot(P, H.T)) + R
             
             # Kalman Gain: K = P H.T / S
@@ -77,9 +63,9 @@ class PairsTrader:
             theta = theta + K * error
             
             # Update Covariance
-            # Stabilized form: P = (I - KH)P(I - KH)' + KRK' 
-            # Or simple form: P = (I - KH)P
-            # We use the simple form but force symmetry
+            # Stabilised: P = (I - KH)P(I - KH)' + KRK' 
+            # simple: P = (I - KH)P
+            # this uses simple form but forces symmetry (xtx maybe use stabilised)
             I_KH = np.eye(2) - np.outer(K, H)
             P = np.dot(I_KH, P)
             
@@ -88,23 +74,18 @@ class PairsTrader:
         return state_means
 
     def backtest(self, series_x: pd.Series, series_y: pd.Series) -> pd.DataFrame:
-        """
-        Run the pairs trading backtest.
-        :param series_x: Price series for asset X (independent variable)
-        :param series_y: Price series for asset Y (dependent variable)
-        :return: DataFrame with full backtest results
-        """
+        # :return: DataFrame with full backtest results
         # Align data
         df = pd.DataFrame({"x": series_x, "y": series_y}).dropna()
         
-        # 1. Beta and Intercept Estimation
+        # Beta and intercept estimation
         if self.use_kalman:
-            # Kalman Filter
+            # Kalman filter
             state_means = self._run_kalman_filter(df["x"].values, df["y"].values)
             df["intercept"] = state_means[:, 0]
             df["beta"] = state_means[:, 1]
             
-            # SHIFT: Use yesterday's parameters to trade today (avoid look-ahead bias)
+            # avoid look ahead bias by using yesterday's trades for todays
             # The KF state_means[t] includes the observation at t. 
             # We must not use it to calculate spread[t] for the signal at t.
             df["intercept"] = df["intercept"].shift(1)
@@ -120,30 +101,28 @@ class PairsTrader:
             df["beta"] = params["x"]
             
             # RollingOLS params at index t are based on window ending at t.
-            # Similarly, we should lag them 1 day to be OOS safe, 
-            # although some momentum strategies trade "on close" with parameters fitted on that close.
-            # For consistency with KF, we shift.
+            # lag them 1 day to be OOS safe though some momentum strategies trade "on close" with parameters fitted on that close. consistency with KF so we shift.
             df["intercept"] = df["intercept"].shift(1)
             df["beta"] = df["beta"].shift(1)
         
-        # 2. Calculate Spread and Z-Score
+        #Calculate spread and z-Score
         df["spread"] = df["y"] - (df["intercept"] + df["beta"] * df["x"])
         
-        # For Z-score, we still use a rolling window of the spread to normalize.
-        # This implicitly assumes the spread mean reverts around a local mean (often 0 if KF works well)
-        # min_periods=lookback ensures we don't get Z-scores until we have enough data. 
-        # But if use_kalman is true, we might want faster signals. Let's use min_periods=1 but with care.
+        # For z-score, use rolling window of spread to normalise
+        # implicitly assumes the spread mean reverts around a local mean (often 0 if KF works well)
+        # min_periods=lookback ensures we don't get z-scores until we have enough data 
+        # if use_kalman is true, faster signals may be better so min_periods=1
         min_periods = self.lookback if not self.use_kalman else 5
         rolling_mean = df["spread"].rolling(window=self.lookback, min_periods=min_periods).mean().shift(1)
         rolling_std = df["spread"].rolling(window=self.lookback, min_periods=min_periods).std().shift(1)
         
-        # Avoid division by zero
+        # avoid division by zero
         rolling_std = rolling_std.fillna(1e-9).replace(0.0, 1e-9)
         
         df["zscore"] = (df["spread"] - rolling_mean) / rolling_std
         df["zscore"] = df["zscore"].fillna(0.0) # Fill initial NaNs with 0
         
-        # 3. Generate Signals and Positions
+        # Generate Signals and Positions
         df["pos_x"] = 0.0
         df["pos_y"] = 0.0
         
@@ -220,7 +199,7 @@ class PairsTrader:
         df["pos_x"] = pos_x
         df["pos_y"] = pos_y
         
-        # 4. Calculate PnL
+        # Calculate PnL
         df["pnl"] = (df["pos_x"].shift(1) * df["x"].diff()) + (df["pos_y"].shift(1) * df["y"].diff())
         
         # Transaction Costs
@@ -237,23 +216,16 @@ class PairsTrader:
         return self.calculate_metrics()
 
     def calculate_metrics(self):
-        """
-        Calculate a comprehensive set of performance metrics.
-        """
         if self.results is None:
             return {}
             
         df = self.results
         returns = df["pnl"] # Daily PnL in dollars. 
-        # Note: To get % returns properly, we need a capital base. 
-        # Assuming we allocate 1.0 (or capital C) to the strategy.
-        # Since the user asked for cumulative PnL (%) and returns, we'll assume a notional capital of 1.0 for simplicity
-        # or treat PnL as dollar PnL and Returns as PnL / 1.0. 
-        # Let's assume Initial Capital = 100 or simply report PnL as absolute if capital is unknown, 
-        # but to satisfy "%" requests, we need a base.
-        # Implied assumption: The positions (weights) sum to ~1.0 gross (0.5 long, 0.5 short).
+        # Note: capital base needed to get % returns properly 
+        # assume we allocate 1.0 (or capital C) to the strategy.
+        # assumes hat the positions (weights) sum to ~1.0 gross (0.5 long, 0.5 short).
         
-        # 1. Risk/Return Metrics
+        # Risk/Return Metrics
         total_pnl = df["pnl"].sum()
         avg_daily_pnl = returns.mean()
         std_daily_pnl = returns.std()
@@ -273,15 +245,10 @@ class PairsTrader:
             sharpe = 0.0
             sortino = 0.0
             
-        # Max Drawdown
+        # Max drawdown
         cum_pnl_series = df["cum_pnl"]
         running_max = cum_pnl_series.cummax()
         drawdown = cum_pnl_series - running_max
-        # Since these are absolute dollar amounts, let's treat generic drawdown.
-        # If we interpret as %, we need capital. Let's assume capital is large enough that PnL is additive.
-        # Or, just report Max Drawdown in $ terms.
-        # However, user asked for "%". Let's assume the trade sizes (weights ~1.0) imply a base of 1.0.
-        # So PnL of 0.10 means 10%.
         max_drawdown = drawdown.min()
         max_drawdown_pct = max_drawdown * 100.0 # Assuming 1.0 base
         
@@ -290,7 +257,7 @@ class PairsTrader:
         # Annualised Return (Simple compounding approximation)
         n_days = len(df)
         if n_days > 0:
-            ann_return = (total_pnl / n_days) * 252 * 100 # Arithmetic annualization
+            ann_return = (total_pnl / n_days) * 252 * 100 # Arithmetic annualisation
         else:
             ann_return = 0.0
 
@@ -299,10 +266,10 @@ class PairsTrader:
         ret_skew = stats.skew(clean_returns)
         ret_kurt = stats.kurtosis(clean_returns)
 
-        # 2. Trade Statistics
+        #Trade Statistics
         trade_stats = self._calculate_trade_stats(df)
         
-        # 3. Spread & Model Stats
+        #Spread & Model Stats
         spread = df["spread"].dropna()
         spread_mean = spread.mean()
         spread_std = spread.std()
@@ -342,10 +309,9 @@ class PairsTrader:
         }
 
     def _calculate_trade_stats(self, df):
-        # Identify trades based on pos_x changing from 0 to something, or flipping.
-        # Since we have pos_x column, we can iterate.
+        # Identify trades based on pos_x changing from 0 to something or flipping..
         # A trade is defined from opening a position (0 -> non-0) to closing it (non-0 -> 0).
-        # Note: Reversals (Long -> Short directly) should be treated as Close Old -> Open New.
+        # Note: Reversals (Long -> Short directly)treated as a close and open
         
         trades = []
         in_trade = False
@@ -377,9 +343,7 @@ class PairsTrader:
                         # New trade starts
                         # pnl[t] contains cost of flipping.
                         # Ideally splitting pnl[t] is hard without more data.
-                        # Simplified: Assign this day's PnL to the *new* trade? 
-                        # Or split? Let's treat pnl[t] as belonging to the new position for simplicity 
-                        # as it pays the cost for the new direction.
+                        # pnl[t] treated as belonging to the new position for simplicity as it pays the cost for the new direction.
                         current_trade_pnl = pnl[t]
                         current_trade_days = 1
                     else:
@@ -472,7 +436,7 @@ class PairsTrader:
 
 if __name__ == "__main__":
     # Example usage
-    np.random.seed(42)
+    np.random.seed(67)
     T = 1000
     x = np.cumsum(np.random.normal(0, 1, T)) + 50
     # Cointegrated y with time-varying beta
