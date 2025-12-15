@@ -31,8 +31,9 @@ This will:
 ## Example Output
 
 Running the script produces output similar to:
-Performance: {'sharpe': 2.41, 'total_pnl': 56.72}
+Performance: {'Annualised Sharpe Ratio': np.float64(1.1), 'Sortino Ratio': np.float64(0.63), 'Cumulative PnL (%)': np.float64(61.0), 'Annualised Return (%)': np.float64(15.37), 'Max Drawdown (%)': np.float64(-6.99), 'Number of Trades': 37, 'Win Rate (%)': 83.78, 'Average Holding Period': np.float64(3.27), 'Mean Spread': np.float64(0.02187), 'Std Spread': np.float64(2.09241), 'Half-life': np.float64(0.47), 'ADF p-value': np.float64(0.0), 'Time in Market (%)': np.float64(12.1), 'Skewness': np.float64(2.65), 'Kurtosis': np.float64(45.16), 'Entry Z': 2.0, 'Exit Z': 0.5}
 
 A plot of cumulative PnL and z-score spread is shown below.
-<img width="1280" height="612" alt="Figure_1" src="https://github.com/user-attachments/assets/f0e6bc10-06d7-40b9-a226-32fefd52bcb4" />
+<img width="1280" height="612" alt="Figure_1" src="https://github.com/user-attachments/assets/4fef43c8-9f29-4375-b290-ef4423ce3532" />
+
 
