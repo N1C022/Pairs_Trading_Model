@@ -1,15 +1,3 @@
-"""
-pairs_trading.py
-
-A cointegration-based statistical arbitrage pairs trading model.
-Includes:
-- yfinance data download
-- Engle–Granger cointegration test
-- OLS hedge ratio estimation
-- z-score spread signal
-- backtest engine
-"""
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -17,10 +5,7 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
 
 
-# ----------------------------------------------------------
-# 1. Download Price Data
-# ----------------------------------------------------------
-
+#Download Price Data
 def load_data(ticker_x, ticker_y, start="2015-01-01"):
     df_x = yf.download(ticker_x, start=start)["Adj Close"]
     df_y = yf.download(ticker_y, start=start)["Adj Close"]
@@ -28,12 +13,11 @@ def load_data(ticker_x, ticker_y, start="2015-01-01"):
     return df
 
 
-# ----------------------------------------------------------
-# 2. Cointegration + Hedge Ratio
-# ----------------------------------------------------------
+
+# Cointegration + Hedge Ratio
 
 def estimate_hedge_ratio(y, x):
-    """OLS regression: y = a + b*x"""
+    #OLS regression: y = a + b*x
     x = sm.add_constant(x)
     model = sm.OLS(y, x).fit()
     return model.params[1]  # slope = hedge ratio
@@ -44,9 +28,7 @@ def check_cointegration(series_x, series_y):
     return pvalue
 
 
-# ----------------------------------------------------------
-# 3. Trading Signals
-# ----------------------------------------------------------
+# Trading Signals
 
 def compute_spread(df, ticker_x, ticker_y, hedge_ratio):
     return df[ticker_y] - hedge_ratio * df[ticker_x]
@@ -79,9 +61,7 @@ def generate_signals(z, entry_z=2.0, exit_z=0.5):
     return pd.Series(positions, index=z.index)
 
 
-# ----------------------------------------------------------
-# 4. Backtest
-# ----------------------------------------------------------
+# backtest
 
 def backtest_pairs(df, ticker_x, ticker_y, hedge_ratio, positions):
     spread = compute_spread(df, ticker_x, ticker_y, hedge_ratio)
